@@ -1,0 +1,494 @@
+---
+title: "NYPD Shooting Incident Data (Historic)"
+author: "Anonymous"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Libraries used
+
+```{r Import packages, message = FALSE}
+#install.packages("ggplot2")
+#install.packages("lubridate")
+#install.packages("gam")
+#install.packages("arm")
+#install.packages("ggcorrplot")
+library("ggplot2");
+library("lubridate");
+library("stringr");
+library("gam");
+library("arm");
+library("ggcorrplot");
+```
+
+
+## EDA & Data Pre-Processing
+
+The dataset we are going to dive into is published on <https://catalog.data.gov/dataset/nypd-shooting-incident-data-historic>, with the latest metadata update dating back to 26-04-2024. It is a recording of every shooting incident going back to 2006, provided by the city of New York. A description of the dataset can be found here <https://data.cityofnewyork.us/Public-Safety/NYPD-Shooting-Incident-Data-Historic-/833y-fsy8/about_data>. Let's read in the CSV:
+
+```{r Creating a pointer to the CSV}
+path = "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+df = read.csv(path)
+```
+
+How many entries do we have?
+```{r length}
+dim(df)
+```
+So, 28562 rows and 21 variables. How do these look like?
+We print the head of the data frame,
+
+```{r Head info}
+head(df)
+```
+as well as a summary:
+```{r summary info}
+summary(df)
+```
+From the above, we can see that we have an identified (INCIDENT_KEY), which we can easily drop. Further, we have a date and time (OCCUR_DATE, OCCUR_TIME), which are provided in char format (not so good, we need to cast this into a suitable format, if we want to keep those). We have further a numerical information on the precinct involved (PRECINCT), which ranges from 1 to 123 (no NAN values here). We also have a jurisdiction code, which ranges from 0 to 2  - do values of 0 make sense? Yes - see the data information linked above: "Jurisdiction where the shooting incident occurred. Jurisdiction codes 0(Patrol), 1(Transit) and 2(Housing) represent NYPD whilst codes 3 and more represent non NYPD jurisdictions". However, we have to take care of the NAN values (dropping these, as replacing them with averages makes little sense).  The mapping information (X_COORD_CD, Y_COORD_CD, Latitude, Longitude) provide the coordinates of the incident in the New York State Plane coordinate system and Global Coordinate system, respectively. Considering the information will be highly correlated and the Global coordinates lack 59 values, it is better to work with the New York coordinate system and drop the Latitude/Longitude information. All other fields are of character format, and we need to check each one to see whether we can use the content as categoricals (with or without pre-processing).
+
+```{r Jurisdiction}
+#0(Patrol), 1(Transit) and 2(Housing) represent NYPD whilst codes 3 and more represent non NYPD jurisdictions
+df$Jurisdiction = "NAN"
+df$Jurisdiction[df$JURISDICTION_CODE==0] = "Patrol"
+df$Jurisdiction[df$JURISDICTION_CODE==1] = "Transit"
+df$Jurisdiction[df$JURISDICTION_CODE==2] = "Housing"
+df$Jurisdiction[df$JURISDICTION_CODE>=3] = "NonNYPD"
+df$Jurisdiction = as.factor(df$Jurisdiction)
+summary(df$Jurisdiction)
+```
+With 2 values being NANs only, it is reasonable to omit the rows:
+
+```{r patrol: drop NAN?}
+df = df[complete.cases(df$JURISDICTION_CODE),]
+summary(df$Jurisdiction)
+```
+
+```{r BORO?}
+unique(df$BORO)
+```
+The BORO field lists the borough where the incident occurred. We have 5 unique values, and no missing entries. We can work with these as a factor!
+
+```{r BORO as factor}
+df$BORO = as.factor(df$BORO)
+(summary(df$BORO))
+```
+This also outlines how many incidents have been registerd for each borough. Next, we have "LOC_OF_OCCUR_DESC", for which no information is provided. Let's have a deeper look:
+
+```{r Desc}
+unique(df$LOC_OF_OCCUR_DESC)
+```
+As it turns out, this is self-explanatory. How many entries are blank?
+
+```{r Location not registered}
+print("Location specified: ")
+length(df$LOC_OF_OCCUR_DESC[df$LOC_OF_OCCUR_DESC!=""])
+print("No location registered:")
+length(df$LOC_OF_OCCUR_DESC[df$LOC_OF_OCCUR_DESC==""])
+```
+Well, that means mostly no location was given. In view of the vast majority of the entries being empty, we can drop that column entirely.
+```{r drop Location}
+df = subset(df, select = - LOC_OF_OCCUR_DESC)
+```
+
+```{r LOC_CLASSFCTN_DESC}
+unique(df$LOC_CLASSFCTN_DESC)
+```
+The location classifier appears problematic, as we have "", "OTHER" and "(null)" among other, valid classifiers. Let's count those:
+
+```{r count invalid entries of LOC_CLASSFCTN_DESC}
+print("Locations not flagged as empty")
+length(df$LOC_CLASSFCTN_DESC[df$LOC_CLASSFCTN_DESC!=""])
+print("Locations flagged as either empty category:")
+length(df$LOC_CLASSFCTN_DESC[df$LOC_CLASSFCTN_DESC==""]) + length(df$LOC_CLASSFCTN_DESC[df$LOC_CLASSFCTN_DESC=="(null)"]) +length(df$LOC_CLASSFCTN_DESC[df$LOC_CLASSFCTN_DESC=="OTHER"])
+```
+Again, only a fraction of the data is useful. We decide to drop the column.
+
+```{r drop Location class}
+df = subset(df, select = - LOC_CLASSFCTN_DESC)
+```
+
+We have another location information, LOCATION_DESC. What is in here?
+
+```{r LOCATION_DESC.}
+unique(df$LOCATION_DESC)
+```
+```{r count}
+print("Empty location information entries:")
+length(df$LOCATION_DESC[df$LOCATION_DESC==""]) + length(df$LOCATION_DESC[df$LOCATION_DESC=="NONE"]) + length(df$LOCATION_DESC[df$LOCATION_DESC=="(null)"])
+print("Remaining entries:")
+length(df$LOCATION_DESC) - (length(df$LOCATION_DESC[df$LOCATION_DESC==""]) + length(df$LOCATION_DESC[df$LOCATION_DESC=="NONE"]) + length(df$LOCATION_DESC[df$LOCATION_DESC=="(null)"]))
+```
+
+Well, here we have a decent number of entries, and we could either proceed with dropping the column again, or use the information given. Since it might give insight on reporting of these incidents, we'll refrain from dropping the column. Instead, we summarize all empty information as "NONE".
+
+```{r redraft location info when empty:}
+df$LOCATION_DESC[df$LOCATION_DESC == ""] = "NONE"
+df$LOCATION_DESC[df$LOCATION_DESC == "(null)"] = "NONE"
+df$LOCATION_DESC = as.factor(df$LOCATION_DESC)
+```
+
+```{r}
+summary(df$LOCATION_DESC)
+```
+This already gives us an overview that most of the categories are infrequently used, with most of the specified categories being housing (MULTI DWELL or PVT).
+
+Next, we have the murder flag. This should be a true or false:
+
+```{r STATISTICAL_MURDER_FLA}
+unique(df$STATISTICAL_MURDER_FLA)
+```
+
+```{r Plot murder flag, echo = FALSE}
+df$STATISTICAL_MURDER_FLAG = as.logical(df$STATISTICAL_MURDER_FLAG)
+ggplot(df, aes(x=STATISTICAL_MURDER_FLAG))+ geom_histogram(stat="count")
+```
+
+```{r murder flag ratio, echo = FALSE}
+print("Fraction of murders reported:")
+print(length(df$STATISTICAL_MURDER_FLAG[df$STATISTICAL_MURDER_FLAG=="TRUE"])/length(df$STATISTICAL_MURDER_FLAG))
+```
+So, roughly 20% of the incidents involved a murder report. (N.B. The definition clarifies that this means that the shooting resulted in the victims death - since murder is a legal definition, we should bear in mind that this merely means that the victim died.)
+
+On to the next column: "PERP_AGE_GROUP".
+
+```{r Age group}
+unique(df$PERP_AGE_GROUP)
+```
+Again, we have empty entries, which need to be summarized as UNKNOWN. The ranges given are self-explanatory (<18, 18-24, 25-44, 45-64, 65+), with some categories defying explanation (neither a range, nor an age: 1020, 940, 224, 1028). Let's see whether they are recurring:
+
+```{r Age group NANs}
+length(df$PERP_AGE_GROUP[df$PERP_AGE_GROUP=="1020"]) + length(df$PERP_AGE_GROUP[df$PERP_AGE_GROUP=="940"]) + length(df$PERP_AGE_GROUP[df$PERP_AGE_GROUP=="1028"]) + length(df$PERP_AGE_GROUP[df$PERP_AGE_GROUP=="224"])
+```
+We can safely assume that these are singular, erroneous entries. Let's flag them as "UNKNOWN" as well.
+
+```{r Unknown perp age groups}
+df$PERP_AGE_GROUP[df$PERP_AGE_GROUP=="1020"] = "UNKNOWN"
+df$PERP_AGE_GROUP[df$PERP_AGE_GROUP=="1028"] = "UNKNOWN"
+df$PERP_AGE_GROUP[df$PERP_AGE_GROUP=="940"] = "UNKNOWN"
+df$PERP_AGE_GROUP[df$PERP_AGE_GROUP=="224"] = "UNKNOWN"
+df$PERP_AGE_GROUP[df$PERP_AGE_GROUP==""] = "UNKNOWN"
+df$PERP_AGE_GROUP[df$PERP_AGE_GROUP=="(null)"] = "UNKNOWN"
+df$PERP_AGE_GROUP = as.factor(df$PERP_AGE_GROUP)
+summary(df$PERP_AGE_GROUP)
+```
+We do the same for VIC_AGE_GROUP:
+
+```{r Victim Age group}
+unique(df$VIC_AGE_GROUP)
+```
+```{r Unknown age groups}
+df$VIC_AGE_GROUP[df$VIC_AGE_GROUP=="1022"] = "UNKNOWN"
+df$VIC_AGE_GROUP = as.factor(df$VIC_AGE_GROUP)
+summary(df$VIC_AGE_GROUP)
+```
+```{r Plot vic age group, echo = FALSE}
+ggplot(df, aes(x=VIC_AGE_GROUP))+ geom_histogram(stat="count")
+```
+```{r PERP_SEX}
+unique(df$PERP_SEX)
+```
+```{r PERP_SEX Unknown}
+df$PERP_SEX[df$PERP_SEX==""] = "U"
+df$PERP_SEX[df$PERP_SEX=="(null)"] = "U"
+df$PERP_SEX = as.factor(df$PERP_SEX)
+summary(df$PERP_SEX)
+```
+
+```{r VIC_SEX}
+unique(df$VIC_SEX)
+```
+```{r PERP/VIC_SEX}
+df$VIC_SEX = as.factor(df$VIC_SEX)
+summary(df$VIC_SEX)
+```
+```{r PERP_RACE}
+unique(df$PERP_RACE)
+```
+```{r VIC_RACE}
+unique(df$VIC_RACE)
+```
+We again group all "", "(null)" and "UNKNOWN" classifiers as "UNKNOWN"
+
+```{r VIC/PERP_RACE}
+df$PERP_RACE[df$PERP_RACE == ""] = "UNKNOWN"
+df$PERP_RACE[df$PERP_RACE == "(null)"] = "UNKNOWN"
+df$PERP_RACE = as.factor(df$PERP_RACE)
+df$VIC_RACE = as.factor(df$VIC_RACE)
+```
+
+We still need to drop 2 entries without any jurisdiction entry:
+
+```{r jurisdiction}
+df <- df[!is.na(df$JURISDICTION_CODE), ]
+```
+
+What should we do about the times and dates? The specific minute of the day probably does not help, neither would be specific days. While we could simply drop them, let us re-draft the time into one of 24 categoricals (1 hour time slots throughout the day):
+
+```{r time}
+df$hour = str_sub(df$OCCUR_TIME, -8, -7)
+df$hour = as.factor(df$hour)
+summary(df$hour)
+```
+For the date, we first recast the mmddyyyy format, and then we extract the weekday:
+```{r date}
+df$weekday = weekdays(as.Date(df$OCCUR_DATE, format = "%m/%d/%y"))
+df$weekday = as.factor(df$weekday)
+unique(df$weekday)
+summary(df$weekday)
+```
+Remember that there were a lot of housing information in the location descriptions? Let's create flag for these:
+
+```{r housing flag}
+df$housing = 0
+df$housing[df$LOCATION_DESC == "MULTI DWELL - APT BUILD"] = 1
+df$housing[df$LOCATION_DESC == "MULTI DWELL - PUBLIC HOUS"] = 1
+df$housing[df$LOCATION_DESC == "PVT HOUSE"] = 1
+df$housing =as.logical((df$housing))
+summary(df$housing)
+```
+
+And with that, we have preprocessed all data - except the Incident_key, Latitude, Longitude and Lon_Lat, which we still need to drop, along with the previous time and date info
+
+```{r df2}
+df2 = subset(df, select = - c(INCIDENT_KEY, Latitude, Longitude, Lon_Lat, OCCUR_DATE, OCCUR_TIME))
+summary(df2)
+```
+## Modelling & Visualizations
+
+With this data set, there is an abundance of aspects to look at - and a multitude of pitfalls to consider. For example, while there might be a lot of what looks like integer values involved, neither of the categories encodes continuous variables, which we could predict, but only categoricals. 
+For this course, I would like to consider how likely it is for a victim to die as a result of the shooting (represented by the boolean true/false of the statistical murder flag entry), based on several predictors. More specifically, I would like to focus on victims' ages and genders (and since we exclusively have the reported sex to look at, we will look at this item only, though we should be aware of sex-gender distinction! Gender-based violence acts on the perceived gender, by a perpetrator, as contrasted to a victim's (assigned) sex or gender (identity). Any analysis on gender-based violence only holds true where the assumption is valid that for most of the underlying population, there is an alignment between assigned sex and gender, as well as that there are generally conveyed, perceived societal norms on a gender binary allowing for identifying either M or F gender. By encoding only the assigned sex, the data set does not allow for looking at non-binary genders), and in particular see if there is any information on domestic violence visible in the data set. Without any domain knowledge, I naively assume a general level of significance of alpha = 0.05.
+
+As we need to use a logit function (we are working on booleans and categoricals), we are predicting using generalized linear models with the binomial family in R. As a reminder, all coefficients predicted therefore involve log-odds, such that we have to take the exponential function to arrive at actual odds of dying from a shooting incident.
+
+Let's look at time information first:
+
+```{r model1}
+class(df$STATISTICAL_MURDER_FLAG)
+mod1 = glm(STATISTICAL_MURDER_FLAG ~ weekday + hour, family = "binomial", df2)
+summary(mod1)
+```
+It appears that the weekday has no influence on survival. How about the hour in isolation: 
+```{r model1-2}
+class(df$STATISTICAL_MURDER_FLAG)
+mod1 = glm(STATISTICAL_MURDER_FLAG ~ hour, family = binomial(), df2)
+summary(mod1)
+```
+Now, we see that we have a mix of statistically significant and non-significant time slots (and we should keep in mind that testing with 24 potential predictors, we are more likely to arrive at one seeming statistically significant!). Can we visualize this?
+
+```{r Visualize survival dep. on hour}
+ggplot(df2, aes(x=(hour), y=(as.numeric(STATISTICAL_MURDER_FLAG)))) +
+  stat_summary(fun = "mean", geom = "bar")
+
+```
+
+One time slot that stands out is in the early morning, that is between 7 and 8. When translating this model into odds of dying, this translates to:
+
+```{r log-odds}
+print("odds of dying at")
+odds = exp(mod1$coefficients["hour07"] + mod1$coefficients["(Intercept)"])
+print(odds)
+print("Percentage chance of dying at")
+print(100*odds/(1+odds))
+```
+Remember that our baseline is at 
+
+```{r Baseline dying chance}
+print("Chance of dying (Baseline):")
+print(mean(df$STATISTICAL_MURDER_FLAG))
+print("Cases reported in said time frame:")
+print(length(df$hour[df2$hour == "07"]))
+print("Fraction (/%) of cases reported in said time frame in relation to all cases")
+print(100*length(df2$hour[df$hour == "07"])/length(df2$hour))
+```
+So, while chances of dying are increasing by more than its half in this time frame, we are looking at merely 0.8% of the data!. (Still, 246 cases is a lot...). Is there a relation between the location being any type of residence and the chance of dying?
+
+```{r location for 0700h}
+summary(df2$housing[df$hour == "07"])
+```
+```{r housing ratio for 0700h}
+print("Percentage of flagged housing incidents between 7 and 8 AM:")
+mean(df2$housing[df$hour == "07"] == TRUE)
+print("Percentage of flagged housing incidents total:")
+mean(df2$housing == TRUE)
+```
+As it turns out, between 7 and 8 AM the ratio of reported residential shootings is the same as for the total data set. We could just as easily have tested that by modeling interaction terms between the housing flag and the time slot:
+
+```{r model 3}
+mod3 = glm(STATISTICAL_MURDER_FLAG ~ housing * hour, family = "binomial", df2)
+summary(mod3)
+```
+
+As it turns out, there are no interaction terms which are deemed statistically significant! However, the flag housing by itself is. Let's create a model removing the interaction terms and consider what this means:
+
+
+```{r model 4}
+mod4 = glm(STATISTICAL_MURDER_FLAG ~ housing + hour, family = "binomial", df2)
+summary(mod4)
+```
+
+```{r housing + hour survival}
+print("Log odds of survial at 07-08 AM are: ")
+print("Logodds = -1.651746 + 1*0.694899 + housing*0.346407")
+print("Odds of dying during 7-8AM in a residential setting:")
+print(exp(-1.651746 + 1*0.694899 + 1*0.346407))
+print("Odds of dying during 7-8AM NOT in a residential setting:")
+print(exp(-1.651746 + 1*0.694899 + 0*0.346407))
+```
+Since we tested for interaction terms, this is not bound to the time frame, and can be generalized (e. g. by creating a model only for the residential flag)
+```{r model 5}
+mod5 = glm(STATISTICAL_MURDER_FLAG ~ housing, family = "binomial", df2)
+summary(mod5)
+```
+```{r housing survival}
+print("Log odds of survial are: ")
+print("Logodds = -1.54462 + housing*0.34799    ")
+print("Odds of dying in a residential setting:")
+print(exp(-1.54462 + 1*0.34799    ))
+print("Odds of dying NOT in a residential setting:")
+print(exp(-1.54462 + 0*0.34799    ))
+```
+We observe that the chances of dying go up significantly when in a residential setting. Naively, this sadly might make sense, as this (also) encodes cases of domestic violence, which are by definition not present in the commercial locations (though shootings in such settings might involve perpetrator-victim relationships!). One could imagine that residential shootings involve less cases where the shooter knows the victim, and more crimes where the shooter's motivation is robbery, and not intent to kill (at least primarily), while it might be tending towards the opposite in residential shootings, on average. However, without any background in Sociology or Criminology an time to read up on studies/statistics regarding domestic violence shootings compared to armed robberies, I'd refrain from concluding this from the data set.
+
+Let us take a look at some further variables:
+
+```{r model 6}
+mod6 = glm(STATISTICAL_MURDER_FLAG ~ housing + VIC_SEX + VIC_AGE_GROUP, family = "binomial", df2)
+summary(mod6)
+```
+It appears that the age group also is significant, while sex is not. We drop the latter for the time being. 
+
+
+```{r model 7}
+mod7 = glm(STATISTICAL_MURDER_FLAG ~ housing + VIC_AGE_GROUP, family = "binomial", df2)
+summary(mod7)
+```
+Without translating the log-odds into real odds, we can directly infer that the chances of dying as a victim increase with increase in age! 
+
+```{r log-odds age translated}
+print("Multiplicative change in odds compared to baseline to die when in age group 65+ in said model")
+print(exp(1.14602))
+```
+Again, this intuitively would make sense, sadly: Recovery chances from any injury decrease for age... Whether this is the real reason behind the correlation, we cannot say, however.
+
+We can also visualize the model coefficients in a more intuitive way: 
+
+```{r plot model 7}
+coefplot(mod7)
+```
+Let's do a quick check whether there are any interaction terms between housing and age groups:
+
+```{r model 8}
+mod8 = glm(STATISTICAL_MURDER_FLAG ~ housing * VIC_AGE_GROUP, family = "binomial", df2)
+summary(mod8)
+
+```
+The data does not support this. 
+Let's add another potential predictor before wrapping things up by looking at a specific subset of the data.
+
+```{r model 9}
+mod9 = glm(STATISTICAL_MURDER_FLAG ~ housing + VIC_AGE_GROUP + Jurisdiction, family = "binomial", df2)
+summary(mod9)
+
+```
+Does it make sense that the Jurisdiction (baseline: Housing) has a significant increase in the likelihood of a victim dying? Probably, as Patrol or Transit jurisdictions are more likely to be called to a potential murder scene? For this, one might need to read up on how the NYPD allocated resources and responsibilities to different jurisdictions.
+
+So, coming back to the original question: Can we say something more about domestic violence embedded in the data set? Domestic violence victims are over proportionally often non-male, and I will assume this also holds for the city of New York. Let's look at the subset of shootings involving any form of housing, as prepared for the data frame in the EDA section (housing either being TRUE or FALSE). For ease of reference, we will define this as df3, where the base level is set to "M":
+
+```{r df3}
+df3 = df2[df2$housing==TRUE,]
+df3$VIC_SEX = factor(df3$VIC_SEX,levels = c ("M","F","U"))
+```
+
+Note that this effectively means that any odds/ratios are conditional on the flag "housing=TRUE"!
+
+How does this specific subset of data look like? (Red for the general, blue for the set condition on housing)
+
+```{r Plot sex, echo = FALSE}
+ggplot() +
+  geom_histogram(data = df2, aes(x=VIC_SEX), stat="count", col = "red") +
+  geom_histogram(data = df3, aes(x=VIC_SEX), stat="count", col = "blue")
+```
+```{r ratio gender, echo = FALSE}
+print("Overall sex distribution:")
+length(df2$VIC_SEX[df2$VIC_SEX=="M"])/length(df2$VIC_SEX)
+length(df2$VIC_SEX[df2$VIC_SEX=="F"])/length(df2$VIC_SEX)
+print("Housing subset sex distribution:")
+length(df3$VIC_SEX[df3$VIC_SEX=="M"])/length(df3$VIC_SEX)
+length(df3$VIC_SEX[df3$VIC_SEX=="F"])/length(df3$VIC_SEX)
+print("Overall entries in data set for either reported sex:")
+length(df2$VIC_SEX[df2$VIC_SEX=="M"])
+length(df2$VIC_SEX[df2$VIC_SEX=="F"])
+print("Housing entries in data set for either reported sex:")
+length(df3$VIC_SEX[df3$VIC_SEX=="M"])
+length(df3$VIC_SEX[df3$VIC_SEX=="F"])
+```
+
+So, we can observe that there is a slight shift in proportions between reported M and F victims when limiting to residential locations. Starting with a first GLM to predict the likelihood of murder based on the reported victim's sex.
+
+```{r model 10}
+mod10 = glm(STATISTICAL_MURDER_FLAG ~ VIC_SEX , family = "binomial", df3)
+summary(mod10)
+```
+It appears that we have a significant level of correlation (0.0137 < 0.05) of dying in a shooting incident when the victim is identified as female. In numbers, the increase from the chosen base (M) is:
+
+```{r Murder bias }
+odds_BL = exp( mod10$coefficients["(Intercept)"])
+chance_BL = 100*odds_BL/(1+odds_BL)
+print("Baseline odds/chance of dying (M):")
+print(odds_BL)
+print(chance_BL)
+
+odds_F = exp(mod10$coefficients["VIC_SEXF"] + mod10$coefficients["(Intercept)"])
+chance_F = 100*odds_F/(1+odds_F)
+print("Odds of dying as a shooting victim for victim identified as F:")
+print(odds_F)
+chance_F_inc = 100*exp(mod10$coefficients["VIC_SEXF"])/(1+exp(mod10$coefficients["VIC_SEXF"]))
+print("/% chance of dying as a shooting victim for victim identified as F:")
+print(chance_F)
+
+```
+So, how can we reconcile the non-significant contribution of the VIC_SEX flag on one hand when looking at the model 6 taking into account victim age groups, housing and victim sex, and a significant contribution when assessing a model only looking at the victim sex flag, either generally or conditioned on the housing flag? We should look at correlations between the different factors, for which we will plot a modified correlation plot (as we do not observe continuous variables, but eiher booleans or multi-factor variables):
+
+```{r correlation plot complete data set equivalent}
+
+model.matrix(~0+., data=df2[,c("STATISTICAL_MURDER_FLAG", "VIC_SEX", "housing", "VIC_AGE_GROUP", "Jurisdiction")]) %>% 
+  cor(use="pairwise.complete.obs") %>% 
+  ggcorrplot(lab=TRUE, lab_size=1.5)
+```
+
+And the correlation plot equivalent for the data conditional on the housing flag:
+```{r correlation plot equivalent}
+
+model.matrix(~0+., data=df3[,c("STATISTICAL_MURDER_FLAG", "VIC_SEX", "VIC_AGE_GROUP", "Jurisdiction")]) %>% 
+  cor(use="pairwise.complete.obs") %>% 
+  ggcorrplot(lab=TRUE, lab_size=2)
+```
+What we can see from the modified correlation matrices is that (general correlation) there is a strong negative correlation between the Patrol Jurisdiction and the housing flag. Apart from that, we can see (general correlation map) a negative correlation between the VIC_SEXM flag and the older age groups (and vice versa for the younger age groups), while we see (corr. map conditioned on housing = TRUE) that a growing positive correlation between the VIC_SEXF flag and the older age groups (and vice versa for the younger age groups) is present: For example, in the housing-conditional data set df3, we have a correlation coefficient of -0.07 for the age group of 18-24 and a coefficient of 0.04 for the age group of 65+. As such, this explains why modelling only the age shows a significant correlation with the statistical murder flag, while taking into account the age groups renders the factor non-significant. It appears that we cannot say anything about gender-based violence on the subset of the data and the chosen analysis, either generally nor domestically (which does not mean it is not present, just that our data and/or analysis do not show it!).
+
+
+## Bias identification
+
+In this data set, we have a lot of potential biases encoded, too many to illustrate all of them. Let's mainly focus on the bias in the fields we have used for the analysis above.
+
+We should recall that the data is a collection of all recorded (!) shooting incidents which took place in the past. This requires a report to be taken up by the NYPD. While it is less likely with gunshot incidents to be not reported compared to other incidents, this is certainly not an absolute, and we might be faced with cases of under-reporting, especially where it requires a victim to make a report (e. g. in domestic shooting incidents). One fallacy would be to assume that the dataset represents the totality of incidents that happened.
+
+Another bias might be to assume that the recorded data is correct (as in representing the actual course of a shooting). We have seen that there are erroneous entries for a few of the incidents (such as report an incorrect age group), and we cannot estimate how accurate the data really is. This might in particular affect the time an incident took place - is the time recorded the actual time of the incident, or an estimate? If it is the former, is it based on a 911 call, or the recollection/statement of a witness? If it is the latter, does it represent the time of where e. g. a gunshot victim was found, rather than the actual shooting? We do not have these information, and depending on how the times were encoded, it might well be that e. g. (to make up a random example) the increase for a likelihood of dying from a shooting incident between 7 and 8 AM might be due to victims being found in their stores by employees walking in before opening.
+
+We have also refrained from using any of the perpetrator data recorded, as it partially requires relying on the recollection of victims/witnesses, adding recollection bias: How do people estimate age of a perpetrator? This is subjective, and people train their perception based on personal experience. In addition, even when a statement is made with uncertainty, is it recorded as "Unknown" or sorted in the "most likely" category?
+
+Further, when talking about gender-based violence, we should quickly reflect that the data records the (victim's) assigned sex, which (in the context of the police reports) is/should be a legal category, and, as mentioned in the Modelling section above, Sex and Gender are two distinct concepts! (Briefly: The former pointing to a biological sex of a human being, the later to i. a. gender roles constructed by society or the gender identity, neither of which being binary unless arbitrarily constructed by society as such.) There is no information on how it is obtained (as recorded in a legal document, such as a passport? And, if so, does it reflect a sex assigned at birth, or a current legal status? Is it self-identified? Estimated by the recording police officer?), and in the form it is recorded, only allows for M(ale), F(emale) and U(nkown) status flags, thereby reinforcing a socially constructed binary representation of sex (and gender), in particular because anyone not being flagged as M or F is assigned in the Unknown category, thereby being grouped in the missing data segment! This is a good example of a (potential) absence bias, both in the creation of the data set as well as possibly affecting anyone reading the data set, that establishing one category creates the perception of the categories being exhaustive (read as in: the listed entries are a full representation of a category). While both a victim's and a perpetrator's sex might be a legally required item recorded in criminal investigations in binary form as either M or F, it is an over-simplified categorization, which, even if it might not be the intent, can fortify stereo-typical perceptions of the world, which lead to discrimination of and harming marginalized minorities. As a data scientist, especially with a background in e. g. engineering, one should be aware of the possibility of taking a too technical view of data sets, thereby missing all the societal constructs, assumptions, prejudices and implications encoded in the data (and hence forming a bias), which is best prevented by continuously learning on these topics. (For those interested, the University of Colorado offers a course on Queering Identities on Coursera: <https://www.coursera.org/learn/queeringidentities/>).
+
+On more general terms, especially in data science, one should also be cautious of falling into the correlation/causality trap: If a data set shows a statistical significant relationship between two variables, it merely means that within said data set, one can observe that a change in one results in the observed change of the other, but not that one causes the other (and certainly not including an indication of directionality.) Similarly, the lack of significant correlation between two variables does not mean there might not be a correlation for which the data set is insufficient to show it.
+
+Regarding potential personal bias, most of the data looked at should not be affected by any I can identify. However, and that is the difficulty in identifying any bias, my perception of the world was formed by the experiences made in my life time, and as such will render any variable observed through the lens of my consciousness; thus any attempt at interpretation will inevitable be biased to some degree. For example, as a European citizen, I might have a rather critical view on private possession of firearms, and with the little knowledge I have regarding the legal status on gun ownership in the US in general and the city of New York in particular, any interpretation of the data and models presented is bound to be based on (over-generalized) assumptions.
+
+If population identifiers (such as age group) were used, care was taken not to attribute anything to either group. The present author might be biased towards deeming such real world data sets to be a poor source of deriving conclusions of value, as these lack features of a controlled study (which cannot be conducted in cases like the present). In view of the plurality of factors embedded in the data set, one is likely bound to find correlations in places where there would be none for a controlled study (remember, for any given significance level of p, one has a chance of success of finding a correlation due to statistical variation with a chance of (1-(1-p)^n)), wherein n is the number of potential predictors). These data sets should therefore only be used as a starting point for further investigation (and adjusting the levels of significance accordingly beforehand).
+
+To comment on the few questions raised when analyzing the data (that is, regarding age, gender and residential locations), as soon as one tries to interpret data, one also adds layers of bias, as information not contained within the data set is added. 
+The first thing that came to my mind in view of the risk of dying from shooting incidents with increasing age was a functional-biological explanation, that is if one were to suffer injuries, recovery would also a function of age. However, there might be other explanations for this. The same goes for residential information, where there is no way of knowing that these relate to domestic violence, but could well relate to armed robberies in residential areas leading to more deaths per shooting than robberies in commercial areas. We simply have no way of knowing what the driving principles behind the correlations (if there are any!) are, and applying our perception of the world might be (in some cases dangerously) misleading.
